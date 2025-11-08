@@ -1,0 +1,233 @@
+(define-data-var next-offer-id uint u1)
+(define-data-var next-order-id uint u1)
+(define-map producers {who: principal} {enabled: bool})
+(define-map energy-balances {who: principal} {balance: uint})
+(define-map offers {id: uint} {seller: principal, amount: uint, available: uint, unit-price: uint, min-qty: uint, expiry: uint, active: bool})
+(define-map orders {id: uint} {offer-id: uint, buyer: principal, seller: principal, amount: uint, unit-price: uint, total: uint, seller-ok: bool, buyer-ok: bool, settled: bool, disputed: bool})
+(define-data-var admin (optional principal) none)
+(define-constant ERR-NOT-PRODUCER u100)
+(define-constant ERR-NONPOSITIVE u101)
+(define-constant ERR-INSUFFICIENT-ENERGY u102)
+(define-constant ERR-MIN-QTY u103)
+(define-constant ERR-OFFER-NOT-FOUND u104)
+(define-constant ERR-OFFER-INACTIVE u105)
+(define-constant ERR-OFFER-EXPIRED u106)
+(define-constant ERR-NOT-SELLER u107)
+(define-constant ERR-ORDER-NOT-FOUND u108)
+(define-constant ERR-NOT-BUYER u109)
+(define-constant ERR-ALREADY-SETTLED u110)
+(define-constant ERR-DISPUTED u111)
+(define-constant ERR-ADMIN-SET u112)
+(define-constant ERR-NOT-ADMIN u113)
+(define-constant ERR-DISPUTE-STATE u114)
+(define-private (is-producer (who principal))
+  (default-to false (get enabled (map-get? producers {who: who}))))
+(define-private (get-balance-of (who principal))
+  (default-to u0 (get balance (map-get? energy-balances {who: who}))))
+(define-private (set-balance-of (who principal) (amount uint))
+  (map-set energy-balances {who: who} {balance: amount}))
+(define-read-only (get-next-ids)
+  {next-offer: (var-get next-offer-id), next-order: (var-get next-order-id)})
+(define-read-only (is-offer-active (id uint))
+  (match (map-get? offers {id: id})
+    offer
+      (get active offer)
+    false))
+(define-read-only (get-offer (id uint))
+  (map-get? offers {id: id}))
+(define-read-only (get-order (id uint))
+  (map-get? orders {id: id}))
+(define-read-only (get-producer (who principal))
+  (map-get? producers {who: who}))
+(define-read-only (get-energy (who principal))
+  (map-get? energy-balances {who: who}))
+(define-public (register-producer)
+  (begin
+    (map-set producers {who: tx-sender} {enabled: true})
+    (ok true)))
+(define-public (set-admin)
+  (if (is-none (var-get admin))
+      (begin (var-set admin (some tx-sender)) (ok true))
+      (err ERR-ADMIN-SET)))
+(define-read-only (get-admin)
+  (var-get admin))
+(define-public (mint-energy (amount uint))
+  (begin
+    (asserts! (> amount u0) (err ERR-NONPOSITIVE))
+    (asserts! (is-producer tx-sender) (err ERR-NOT-PRODUCER))
+    (let ((bal (get-balance-of tx-sender)))
+      (set-balance-of tx-sender (+ bal amount))
+      (ok (+ bal amount)))))
+(define-private (withdraw-energy (who principal) (amount uint))
+  (let ((bal (get-balance-of who)))
+    (if (>= bal amount)
+        (begin (set-balance-of who (- bal amount)) (ok (- bal amount)))
+        (err ERR-INSUFFICIENT-ENERGY))))
+(define-public (create-offer (amount uint) (unit-price uint) (min-qty uint) (expires-in uint))
+  (begin
+    (asserts! (is-producer tx-sender) (err ERR-NOT-PRODUCER))
+    (asserts! (> amount u0) (err ERR-NONPOSITIVE))
+    (asserts! (> unit-price u0) (err ERR-NONPOSITIVE))
+    (asserts! (> min-qty u0) (err ERR-NONPOSITIVE))
+    (asserts! (<= min-qty amount) (err ERR-MIN-QTY))
+    (try! (withdraw-energy tx-sender amount))
+(let ((id (var-get next-offer-id))
+          (exp expires-in))
+      (map-set offers {id: id}
+        {seller: tx-sender, amount: amount, available: amount, unit-price: unit-price, min-qty: min-qty, expiry: exp, active: true})
+      (var-set next-offer-id (+ id u1))
+      (ok id))))
+(define-public (cancel-offer (id uint))
+  (match (map-get? offers {id: id})
+    offer
+      (begin
+        (asserts! (is-eq (get seller offer) tx-sender) (err ERR-NOT-SELLER))
+        (asserts! (get active offer) (err ERR-OFFER-INACTIVE))
+        (let ((avail (get available offer)))
+          (if (> avail u0)
+              (set-balance-of tx-sender (+ (get-balance-of tx-sender) avail))
+              true)
+          (map-set offers {id: id}
+            {seller: (get seller offer), amount: (get amount offer), available: u0, unit-price: (get unit-price offer), min-qty: (get min-qty offer), expiry: (get expiry offer), active: false})
+          (ok true)))
+    (err ERR-OFFER-NOT-FOUND)))
+(define-private (ensure-offer-open (offer {seller: principal, amount: uint, available: uint, unit-price: uint, min-qty: uint, expiry: uint, active: bool}))
+  (if (get active offer)
+      (ok true)
+      (err ERR-OFFER-INACTIVE)))
+(define-public (place-order (offer-id uint) (amount uint))
+  (match (map-get? offers {id: offer-id})
+    offer
+      (begin
+(asserts! (> amount u0) (err ERR-NONPOSITIVE))
+        (try! (ensure-offer-open offer))
+        (asserts! (>= (get available offer) amount) (err ERR-INSUFFICIENT-ENERGY))
+        (asserts! (>= amount (get min-qty offer)) (err ERR-MIN-QTY))
+        (let ((price (get unit-price offer))
+              (new-avail (- (get available offer) amount))
+              (oid (var-get next-order-id))
+              (total (* amount (get unit-price offer))))
+          (map-set offers {id: offer-id}
+            {seller: (get seller offer), amount: (get amount offer), available: new-avail, unit-price: price, min-qty: (get min-qty offer), expiry: (get expiry offer), active: (get active offer)})
+          (map-set orders {id: oid}
+            {offer-id: offer-id, buyer: tx-sender, seller: (get seller offer), amount: amount, unit-price: price, total: total, seller-ok: false, buyer-ok: false, settled: false, disputed: false})
+          (var-set next-order-id (+ oid u1))
+          (ok oid)))
+    (err ERR-OFFER-NOT-FOUND)))
+(define-public (seller-confirm-delivery (order-id uint))
+  (match (map-get? orders {id: order-id})
+    o
+      (begin
+        (asserts! (is-eq (get seller o) tx-sender) (err ERR-NOT-SELLER))
+        (asserts! (not (get settled o)) (err ERR-ALREADY-SETTLED))
+        (asserts! (not (get disputed o)) (err ERR-DISPUTED))
+        (map-set orders {id: order-id}
+          {offer-id: (get offer-id o), buyer: (get buyer o), seller: (get seller o), amount: (get amount o), unit-price: (get unit-price o), total: (get total o), seller-ok: true, buyer-ok: (get buyer-ok o), settled: (get settled o), disputed: (get disputed o)})
+        (ok true))
+    (err ERR-ORDER-NOT-FOUND)))
+(define-private (settle-if-ready (order-id uint) (o {offer-id: uint, buyer: principal, seller: principal, amount: uint, unit-price: uint, total: uint, seller-ok: bool, buyer-ok: bool, settled: bool, disputed: bool}))
+  (if (and (get seller-ok o) (get buyer-ok o) (not (get settled o)))
+      (begin
+        (set-balance-of (get buyer o) (+ (get-balance-of (get buyer o)) (get amount o)))
+        (map-set orders {id: order-id}
+          {offer-id: (get offer-id o), buyer: (get buyer o), seller: (get seller o), amount: (get amount o), unit-price: (get unit-price o), total: (get total o), seller-ok: (get seller-ok o), buyer-ok: (get buyer-ok o), settled: true, disputed: false})
+        true)
+      false))
+(define-public (buyer-confirm-receipt (order-id uint))
+  (match (map-get? orders {id: order-id})
+    o
+      (begin
+        (asserts! (is-eq (get buyer o) tx-sender) (err ERR-NOT-BUYER))
+        (asserts! (not (get settled o)) (err ERR-ALREADY-SETTLED))
+        (asserts! (not (get disputed o)) (err ERR-DISPUTED))
+        (map-set orders {id: order-id}
+          {offer-id: (get offer-id o), buyer: (get buyer o), seller: (get seller o), amount: (get amount o), unit-price: (get unit-price o), total: (get total o), seller-ok: (get seller-ok o), buyer-ok: true, settled: (get settled o), disputed: (get disputed o)})
+        (settle-if-ready order-id (unwrap! (map-get? orders {id: order-id}) (err ERR-ORDER-NOT-FOUND)))
+        (ok true))
+    (err ERR-ORDER-NOT-FOUND)))
+(define-public (raise-dispute (order-id uint))
+  (match (map-get? orders {id: order-id})
+    o
+      (begin
+        (asserts! (or (is-eq (get buyer o) tx-sender) (is-eq (get seller o) tx-sender)) (err ERR-DISPUTE-STATE))
+        (asserts! (not (get settled o)) (err ERR-ALREADY-SETTLED))
+        (map-set orders {id: order-id}
+          {offer-id: (get offer-id o), buyer: (get buyer o), seller: (get seller o), amount: (get amount o), unit-price: (get unit-price o), total: (get total o), seller-ok: (get seller-ok o), buyer-ok: (get buyer-ok o), settled: false, disputed: true})
+        (ok true))
+    (err ERR-ORDER-NOT-FOUND)))
+(define-private (only-admin)
+  (match (var-get admin)
+    a
+      (if (is-eq a tx-sender) (ok true) (err ERR-NOT-ADMIN))
+    (err ERR-NOT-ADMIN)))
+(define-public (admin-resolve-refund-buyer (order-id uint))
+(begin
+    (try! (only-admin))
+    (match (map-get? orders {id: order-id})
+      o
+        (begin
+          (asserts! (get disputed o) (err ERR-DISPUTE-STATE))
+          (map-set orders {id: order-id}
+            {offer-id: (get offer-id o), buyer: (get buyer o), seller: (get seller o), amount: (get amount o), unit-price: (get unit-price o), total: (get total o), seller-ok: false, buyer-ok: false, settled: true, disputed: false})
+          (let ((off (unwrap! (map-get? offers {id: (get offer-id o)}) (err ERR-OFFER-NOT-FOUND))))
+            (map-set offers {id: (get offer-id o)}
+              {seller: (get seller off), amount: (get amount off), available: (+ (get available off) (get amount o)), unit-price: (get unit-price off), min-qty: (get min-qty off), expiry: (get expiry off), active: (get active off)})
+            (ok true)))
+      (err ERR-ORDER-NOT-FOUND))))
+(define-public (admin-resolve-release-to-buyer (order-id uint))
+(begin
+    (try! (only-admin))
+    (match (map-get? orders {id: order-id})
+      o
+        (begin
+          (asserts! (get disputed o) (err ERR-DISPUTE-STATE))
+          (set-balance-of (get buyer o) (+ (get-balance-of (get buyer o)) (get amount o)))
+          (map-set orders {id: order-id}
+            {offer-id: (get offer-id o), buyer: (get buyer o), seller: (get seller o), amount: (get amount o), unit-price: (get unit-price o), total: (get total o), seller-ok: (get seller-ok o), buyer-ok: (get buyer-ok o), settled: true, disputed: false})
+          (ok true))
+      (err ERR-ORDER-NOT-FOUND))))
+(define-read-only (offer-stats)
+  (let ((n (var-get next-offer-id)))
+    {next: n}))
+(define-read-only (order-stats)
+  (let ((n (var-get next-order-id)))
+    {next: n}))
+(define-public (deactivate-offer (id uint))
+  (match (map-get? offers {id: id})
+    offer
+      (begin
+        (asserts! (is-eq (get seller offer) tx-sender) (err ERR-NOT-SELLER))
+        (map-set offers {id: id}
+          {seller: (get seller offer), amount: (get amount offer), available: (get available offer), unit-price: (get unit-price offer), min-qty: (get min-qty offer), expiry: (get expiry offer), active: false})
+        (ok true))
+    (err ERR-OFFER-NOT-FOUND)))
+(define-public (reactivate-offer (id uint) (extend-by uint))
+  (match (map-get? offers {id: id})
+    offer
+      (begin
+        (asserts! (is-eq (get seller offer) tx-sender) (err ERR-NOT-SELLER))
+(let ((new-exp (+ (get expiry offer) extend-by)))
+          (map-set offers {id: id}
+            {seller: (get seller offer), amount: (get amount offer), available: (get available offer), unit-price: (get unit-price offer), min-qty: (get min-qty offer), expiry: new-exp, active: true})
+          (ok true)))
+    (err ERR-OFFER-NOT-FOUND)))
+(define-public (update-min-qty (id uint) (min-qty uint))
+  (match (map-get? offers {id: id})
+    offer
+      (begin
+        (asserts! (is-eq (get seller offer) tx-sender) (err ERR-NOT-SELLER))
+        (asserts! (> min-qty u0) (err ERR-NONPOSITIVE))
+        (map-set offers {id: id}
+          {seller: (get seller offer), amount: (get amount offer), available: (get available offer), unit-price: (get unit-price offer), min-qty: min-qty, expiry: (get expiry offer), active: (get active offer)})
+        (ok true))
+    (err ERR-OFFER-NOT-FOUND)))
+(define-public (update-unit-price (id uint) (unit-price uint))
+  (match (map-get? offers {id: id})
+    offer
+      (begin
+        (asserts! (is-eq (get seller offer) tx-sender) (err ERR-NOT-SELLER))
+        (asserts! (> unit-price u0) (err ERR-NONPOSITIVE))
+        (map-set offers {id: id}
+          {seller: (get seller offer), amount: (get amount offer), available: (get available offer), unit-price: unit-price, min-qty: (get min-qty offer), expiry: (get expiry offer), active: (get active offer)})
+        (ok true))
+    (err ERR-OFFER-NOT-FOUND)))
